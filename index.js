@@ -208,7 +208,7 @@ app.delete('/books/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ── Borrows ───────────────────────────────────────────────────────────────
+// ── Borrows: Transactional Borrow // ── Borrows ── Return ───────────────────────────────────────────────────────────────
 app.post('/borrows', verifyToken, async (req, res) => {
   try {
     const { bookId, bookTitle, bookImage, userEmail, userName, borrowDate, returnDate } = req.body;
