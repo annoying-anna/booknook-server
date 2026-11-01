@@ -60,3 +60,4 @@ JWT_SECRET=your_jwt_secret_key
    npm start
    ```
 5. Server will start at `http://localhost:5000`.
+
