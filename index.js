@@ -14,19 +14,31 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// ─── MongoDB Client ───────────────────────────────────────────────────────────
-const uri = process.env.MONGODB_URI;
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
+// ─── Serverless MongoDB Connection Helper ────────────────────────────────────
+let cachedDb = null;
+let cachedClient = null;
 
-const db = client.db('booknook');
-const booksCollection = db.collection('books');
-const borrowsCollection = db.collection('borrows');
+async function connectDB() {
+  if (cachedDb) {
+    return { db: cachedDb, client: cachedClient };
+  }
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error('MONGODB_URI environment variable is not defined');
+  }
+  const client = new MongoClient(uri, {
+    serverApi: {
+      version: ServerApiVersion.v1,
+      strict: true,
+      deprecationErrors: true,
+    },
+  });
+  await client.connect();
+  const db = client.db('booknook');
+  cachedClient = client;
+  cachedDb = db;
+  return { db, client };
+}
 
 // ─── JWT Middleware ───────────────────────────────────────────────────────────
 function verifyToken(req, res, next) {
@@ -64,7 +76,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// ── JWT Authentication // ── JWT ── Token Issuance ───────────────────────────────────────────────────────────────────
+// ── JWT ───────────────────────────────────────────────────────────────────
 app.post('/jwt', (req, res) => {
   const { email } = req.body;
   if (!email) {
@@ -78,9 +90,11 @@ app.post('/jwt', (req, res) => {
   res.json({ token, message: 'Token generated successfully' });
 });
 
-// ── Books: Core CRUD Endpoints ─────────────────────────────────────────────────────────────────
+// ── Books ─────────────────────────────────────────────────────────────────
 app.get('/books', async (req, res) => {
   try {
+    const { db } = await connectDB();
+    const booksCollection = db.collection('books');
     const { email, limit, category } = req.query;
     const query = {};
     if (email) {
@@ -99,12 +113,14 @@ app.get('/books', async (req, res) => {
     res.json(books);
   } catch (err) {
     console.error('GET /books error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
 app.get('/books/new-arrivals', async (req, res) => {
   try {
+    const { db } = await connectDB();
+    const booksCollection = db.collection('books');
     const books = await booksCollection
       .find()
       .sort({ createdAt: -1 })
@@ -113,7 +129,7 @@ app.get('/books/new-arrivals', async (req, res) => {
     res.json(books);
   } catch (err) {
     console.error('GET /books/new-arrivals error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -123,6 +139,8 @@ app.get('/books/:id', async (req, res) => {
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'Invalid book ID format' });
     }
+    const { db } = await connectDB();
+    const booksCollection = db.collection('books');
     const book = await booksCollection.findOne({ _id: new ObjectId(id) });
     if (!book) {
       return res.status(404).json({ error: 'Book not found' });
@@ -130,7 +148,7 @@ app.get('/books/:id', async (req, res) => {
     res.json(book);
   } catch (err) {
     console.error('GET /books/:id error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -140,6 +158,9 @@ app.post('/books', verifyToken, async (req, res) => {
     if (!title || !author || !category || !image || !description) {
       return res.status(400).json({ error: 'Missing required book fields' });
     }
+
+    const { db } = await connectDB();
+    const booksCollection = db.collection('books');
 
     const newBook = {
       title,
@@ -157,7 +178,7 @@ app.post('/books', verifyToken, async (req, res) => {
     res.status(201).json({ insertedId: result.insertedId, message: 'Book added successfully' });
   } catch (err) {
     console.error('POST /books error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -175,6 +196,9 @@ app.patch('/books/:id', verifyToken, async (req, res) => {
       updates.totalCopies = parseInt(updates.totalCopies) || 0;
     }
 
+    const { db } = await connectDB();
+    const booksCollection = db.collection('books');
+
     const result = await booksCollection.updateOne(
       { _id: new ObjectId(id) },
       { $set: updates }
@@ -186,7 +210,7 @@ app.patch('/books/:id', verifyToken, async (req, res) => {
     res.json({ modifiedCount: result.modifiedCount, message: 'Book updated successfully' });
   } catch (err) {
     console.error('PATCH /books/:id error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -197,6 +221,9 @@ app.delete('/books/:id', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Invalid book ID format' });
     }
 
+    const { db } = await connectDB();
+    const booksCollection = db.collection('books');
+
     const result = await booksCollection.deleteOne({ _id: new ObjectId(id) });
     if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'Book not found' });
@@ -204,11 +231,11 @@ app.delete('/books/:id', verifyToken, async (req, res) => {
     res.json({ deletedCount: result.deletedCount, message: 'Book deleted successfully' });
   } catch (err) {
     console.error('DELETE /books/:id error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
-// ── Borrows: Transactional Borrow // ── Borrows ── Return ───────────────────────────────────────────────────────────────
+// ── Borrows ───────────────────────────────────────────────────────────────
 app.post('/borrows', verifyToken, async (req, res) => {
   try {
     const { bookId, bookTitle, bookImage, userEmail, userName, borrowDate, returnDate } = req.body;
@@ -218,7 +245,11 @@ app.post('/borrows', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Book ID is required' });
     }
 
-    // 1. Check if user already borrowed this book and hasn't returned it
+    const { db } = await connectDB();
+    const booksCollection = db.collection('books');
+    const borrowsCollection = db.collection('borrows');
+
+    // 1. Check if user already borrowed this book
     const existingBorrow = await borrowsCollection.findOne({ bookId, userEmail: targetEmail });
     if (existingBorrow) {
       return res.status(400).json({ 
@@ -240,14 +271,12 @@ app.post('/borrows', verifyToken, async (req, res) => {
         });
       }
 
-      // 3. Decrement totalCopies in books collection with $inc
       await booksCollection.updateOne(
         { _id: new ObjectId(bookId) },
         { $inc: { totalCopies: -1 } }
       );
     }
 
-    // 4. Insert borrow record
     const borrowRecord = {
       bookId,
       bookTitle: bookTitle || 'Unknown Book',
@@ -263,7 +292,7 @@ app.post('/borrows', verifyToken, async (req, res) => {
     res.status(201).json({ insertedId: result.insertedId, message: 'Book borrowed successfully!' });
   } catch (err) {
     console.error('POST /borrows error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -273,6 +302,9 @@ app.get('/borrows', verifyToken, async (req, res) => {
     const queryEmail = req.query.email;
     const filterEmail = queryEmail || tokenEmail;
 
+    const { db } = await connectDB();
+    const borrowsCollection = db.collection('borrows');
+
     const borrows = await borrowsCollection
       .find({ userEmail: filterEmail })
       .sort({ borrowedAt: -1 })
@@ -281,7 +313,7 @@ app.get('/borrows', verifyToken, async (req, res) => {
     res.json(borrows);
   } catch (err) {
     console.error('GET /borrows error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -291,6 +323,10 @@ app.delete('/borrows/:id', verifyToken, async (req, res) => {
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'Invalid borrow ID format' });
     }
+
+    const { db } = await connectDB();
+    const booksCollection = db.collection('books');
+    const borrowsCollection = db.collection('borrows');
 
     const borrowRecord = await borrowsCollection.findOne({ _id: new ObjectId(id) });
     if (!borrowRecord) {
@@ -309,19 +345,14 @@ app.delete('/borrows/:id', verifyToken, async (req, res) => {
     res.json({ message: 'Book returned successfully!' });
   } catch (err) {
     console.error('DELETE /borrows/:id error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
-// ── Connect & Start Server ────────────────────────────────────────────────────
-client.connect().then(() => {
-  console.log('✅ Connected to MongoDB Atlas');
-}).catch(err => {
-  console.error('⚠️ MongoDB Connection warning:', err);
-});
-
-app.listen(port, () => {
-  console.log(`🚀 BookNook server running on port ${port}`);
-});
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`🚀 BookNook server running on port ${port}`);
+  });
+}
 
 module.exports = app;
