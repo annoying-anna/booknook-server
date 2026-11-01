@@ -64,7 +64,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// ── JWT ───────────────────────────────────────────────────────────────────
+// ── JWT Authentication // ── JWT ── Token Issuance ───────────────────────────────────────────────────────────────────
 app.post('/jwt', (req, res) => {
   const { email } = req.body;
   if (!email) {
