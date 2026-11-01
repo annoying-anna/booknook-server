@@ -78,7 +78,7 @@ app.post('/jwt', (req, res) => {
   res.json({ token, message: 'Token generated successfully' });
 });
 
-// ── Books ─────────────────────────────────────────────────────────────────
+// ── Books: Core CRUD Endpoints ─────────────────────────────────────────────────────────────────
 app.get('/books', async (req, res) => {
   try {
     const { email, limit, category } = req.query;
