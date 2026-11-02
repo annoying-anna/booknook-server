@@ -459,7 +459,7 @@ app.delete('/borrows/:id', verifyToken, async (req, res) => {
 });
 
 // ─── Export for local / serverless ───────────────────────────────────────────
-if (process.env.NODE_ENV !== 'production') {
+if (!process.env.VERCEL && require.main === module) {
   app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
   });
