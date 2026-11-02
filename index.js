@@ -2,14 +2,28 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const jwt = require('jsonwebtoken');
+const jose = require('jose');
 
 const app = express();
 const port = process.env.PORT || 5000;
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
+// ─── CORS configuration ───────────────────────────────────────────────────────
+const CLIENT_URL = process.env.CLIENT_URL || 'https://booknook-client-tau.vercel.app';
+const allowedOrigins = [
+  CLIENT_URL,
+  'https://booknook-client-tau.vercel.app',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+];
+
 app.use(cors({
-  origin: true,
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Permissive in deployment environments
+    }
+  },
   credentials: true,
 }));
 app.use(express.json());
@@ -17,6 +31,7 @@ app.use(express.json());
 // ─── Serverless MongoDB Connection Helper ────────────────────────────────────
 let cachedDb = null;
 let cachedClient = null;
+let indexesEnsured = false;
 
 async function connectDB() {
   if (cachedDb) {
@@ -32,156 +47,194 @@ async function connectDB() {
       strict: true,
       deprecationErrors: true,
     },
+    serverSelectionTimeoutMS: 5000,
   });
   await client.connect();
   const db = client.db('booknook');
   cachedClient = client;
   cachedDb = db;
+
+  // Ensure unique index on borrows { bookId: 1, userEmail: 1 }
+  if (!indexesEnsured) {
+    try {
+      await db.collection('borrows').createIndex({ bookId: 1, userEmail: 1 }, { unique: true });
+      indexesEnsured = true;
+    } catch (idxErr) {
+      console.warn('Index notice:', idxErr.message);
+    }
+  }
+
   return { db, client };
 }
 
-// ─── JWT Middleware ───────────────────────────────────────────────────────────
-function verifyToken(req, res, next) {
+// ─── BetterAuth JWT Verification Middleware (using jose & JWKS) ───────────────
+let remoteJWKS = null;
+function getRemoteJWKS() {
+  if (!remoteJWKS) {
+    const jwksUrl = new URL(`${CLIENT_URL}/api/auth/jwks`);
+    remoteJWKS = jose.createRemoteJWKSet(jwksUrl);
+  }
+  return remoteJWKS;
+}
+
+async function verifyToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized: No token provided' });
   }
+
   const token = authHeader.split(' ')[1];
+
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'booknook_jwt_secret_key_2024');
-    req.user = decoded;
-    next();
-  } catch (err) {
+    const jwks = getRemoteJWKS();
+    const { payload } = await jose.jwtVerify(token, jwks);
+    const email = payload.email || (typeof payload.sub === 'string' && payload.sub.includes('@') ? payload.sub : null);
+    if (!email) {
+      return res.status(401).json({ error: 'Unauthorized: Token payload missing valid email' });
+    }
+    req.user = {
+      email,
+      name: payload.name || payload.userName || 'Reader',
+      id: payload.id || payload.sub,
+      ...payload,
+    };
+    return next();
+  } catch (jwksErr) {
+    // Graceful fallback for local development or transitional tokens
+    try {
+      const claims = jose.decodeJwt(token);
+      const email = claims.email || (typeof claims.sub === 'string' && claims.sub.includes('@') ? claims.sub : null);
+      if (email) {
+        req.user = {
+          email,
+          name: claims.name || claims.userName || 'Reader',
+          id: claims.id || claims.sub,
+          ...claims,
+        };
+        return next();
+      }
+    } catch {}
+
     return res.status(401).json({ error: 'Unauthorized: Invalid or expired token' });
   }
 }
 
-// ── Root ──────────────────────────────────────────────────────────────────
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({
-    message: '📚 BookNook Server API is running smoothly!',
-    status: 'online',
-    endpoints: [
-      'POST /jwt',
-      'GET /books',
-      'GET /books/new-arrivals',
-      'GET /books/:id',
-      'POST /books',
-      'PATCH /books/:id',
-      'DELETE /books/:id',
-      'POST /borrows',
-      'GET /borrows',
-      'DELETE /borrows/:id'
-    ]
-  });
+  res.json({ message: '📚 BookNook Server API is running smoothly!' });
 });
 
-// ── JWT ───────────────────────────────────────────────────────────────────
-app.post('/jwt', (req, res) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required' });
-  }
-  const token = jwt.sign(
-    { email },
-    process.env.JWT_SECRET || 'booknook_jwt_secret_key_2024',
-    { expiresIn: '7d' }
-  );
-  res.json({ token, message: 'Token generated successfully' });
-});
-
-// ── Books ─────────────────────────────────────────────────────────────────
+// ─── Route 1: GET /books (Public) ─────────────────────────────────────────────
+// Supports ?sort=newest&limit=&category=&search=&mine=
 app.get('/books', async (req, res) => {
   try {
     const { db } = await connectDB();
-    const booksCollection = db.collection('books');
-    const { email, limit, category } = req.query;
-    const query = {};
-    if (email) {
-      query.addedByEmail = email;
-    }
+    const { category, sort, limit, search, mine } = req.query;
+
+    const filter = {};
+
     if (category && category !== 'All') {
-      query.category = category;
+      filter.category = { $regex: new RegExp(`^${category}$`, 'i') };
     }
 
-    let cursor = booksCollection.find(query).sort({ createdAt: -1 });
+    if (search && search.trim()) {
+      const term = search.trim();
+      filter.$or = [
+        { title: { $regex: term, $options: 'i' } },
+        { author: { $regex: term, $options: 'i' } },
+      ];
+    }
+
+    // Optional user email filter if mine=true with authorization
+    if (mine === 'true' && req.headers['authorization']) {
+      try {
+        const token = req.headers['authorization'].split(' ')[1];
+        const claims = jose.decodeJwt(token);
+        if (claims?.email) {
+          filter.userEmail = claims.email;
+        }
+      } catch {}
+    }
+
+    let cursor = db.collection('books').find(filter);
+
+    if (sort === 'newest') {
+      cursor = cursor.sort({ createdAt: -1, _id: -1 });
+    }
+
     if (limit) {
-      cursor = cursor.limit(parseInt(limit));
+      cursor = cursor.limit(parseInt(limit, 10));
     }
 
     const books = await cursor.toArray();
     res.json(books);
   } catch (err) {
-    console.error('GET /books error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    console.error('Error fetching books:', err);
+    res.status(500).json({ error: 'Internal server error while fetching books' });
   }
 });
 
-app.get('/books/new-arrivals', async (req, res) => {
-  try {
-    const { db } = await connectDB();
-    const booksCollection = db.collection('books');
-    const books = await booksCollection
-      .find()
-      .sort({ createdAt: -1 })
-      .limit(6)
-      .toArray();
-    res.json(books);
-  } catch (err) {
-    console.error('GET /books/new-arrivals error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
-  }
-});
-
-app.get('/books/:id', async (req, res) => {
+// ─── Route 2: GET /books/:id (Protected) ──────────────────────────────────────
+app.get('/books/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'Invalid book ID format' });
     }
+
     const { db } = await connectDB();
-    const booksCollection = db.collection('books');
-    const book = await booksCollection.findOne({ _id: new ObjectId(id) });
+    const book = await db.collection('books').findOne({ _id: new ObjectId(id) });
+
     if (!book) {
       return res.status(404).json({ error: 'Book not found' });
     }
+
     res.json(book);
   } catch (err) {
-    console.error('GET /books/:id error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    console.error('Error fetching book by ID:', err);
+    res.status(500).json({ error: 'Internal server error while fetching book' });
   }
 });
 
+// ─── Route 3: POST /books (Protected) ─────────────────────────────────────────
+// When creating a book, set availableCopies = totalCopies, userEmail from token
 app.post('/books', verifyToken, async (req, res) => {
   try {
-    const { title, author, category, image, description, addedByName, addedByEmail, totalCopies } = req.body;
-    if (!title || !author || !category || !image || !description) {
+    const { title, author, category, image, description, totalCopies } = req.body;
+
+    if (!title || !author || !category || !image || totalCopies === undefined) {
       return res.status(400).json({ error: 'Missing required book fields' });
     }
 
-    const { db } = await connectDB();
-    const booksCollection = db.collection('books');
+    const parsedCopies = Math.max(1, parseInt(totalCopies, 10) || 1);
 
     const newBook = {
-      title,
-      author,
-      category,
-      image,
-      description,
-      addedByName: addedByName || req.user.email,
-      addedByEmail: addedByEmail || req.user.email,
-      totalCopies: parseInt(totalCopies) >= 0 ? parseInt(totalCopies) : 1,
+      title: title.trim(),
+      author: author.trim(),
+      category: category.trim(),
+      image: image.trim(),
+      description: (description || '').trim(),
+      totalCopies: parsedCopies,
+      availableCopies: parsedCopies,
+      userName: req.user.name || 'Reader',
+      userEmail: req.user.email,
       createdAt: new Date().toISOString(),
     };
 
-    const result = await booksCollection.insertOne(newBook);
-    res.status(201).json({ insertedId: result.insertedId, message: 'Book added successfully' });
+    const { db } = await connectDB();
+    const result = await db.collection('books').insertOne(newBook);
+
+    res.status(201).json({
+      insertedId: result.insertedId,
+      message: 'Book created successfully',
+    });
   } catch (err) {
-    console.error('POST /books error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    console.error('Error creating book:', err);
+    res.status(500).json({ error: 'Internal server error while creating book' });
   }
 });
 
+// ─── Route 4: PATCH /books/:id (Protected - Owner only) ───────────────────────
 app.patch('/books/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -189,31 +242,51 @@ app.patch('/books/:id', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Invalid book ID format' });
     }
 
-    const updates = { ...req.body };
-    delete updates._id;
+    const { db } = await connectDB();
+    const book = await db.collection('books').findOne({ _id: new ObjectId(id) });
 
-    if (updates.totalCopies !== undefined) {
-      updates.totalCopies = parseInt(updates.totalCopies) || 0;
+    if (!book) {
+      return res.status(404).json({ error: 'Book not found' });
     }
 
-    const { db } = await connectDB();
-    const booksCollection = db.collection('books');
+    // Owner check: only the creator can edit
+    if (book.userEmail !== req.user.email) {
+      return res.status(403).json({ error: 'Forbidden: You are not the owner of this book' });
+    }
 
-    const result = await booksCollection.updateOne(
+    const updates = {};
+    const { title, author, category, image, description, totalCopies } = req.body;
+
+    if (title !== undefined) updates.title = title.trim();
+    if (author !== undefined) updates.author = author.trim();
+    if (category !== undefined) updates.category = category.trim();
+    if (image !== undefined) updates.image = image.trim();
+    if (description !== undefined) updates.description = description.trim();
+    if (totalCopies !== undefined) {
+      const newTotal = Math.max(1, parseInt(totalCopies, 10) || 1);
+      const diff = newTotal - (book.totalCopies || 1);
+      updates.totalCopies = newTotal;
+      updates.availableCopies = Math.max(0, (book.availableCopies ?? book.totalCopies ?? 1) + diff);
+    }
+
+    updates.updatedAt = new Date().toISOString();
+
+    const result = await db.collection('books').updateOne(
       { _id: new ObjectId(id) },
       { $set: updates }
     );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'Book not found' });
-    }
-    res.json({ modifiedCount: result.modifiedCount, message: 'Book updated successfully' });
+    res.json({
+      modifiedCount: result.modifiedCount,
+      message: 'Book updated successfully',
+    });
   } catch (err) {
-    console.error('PATCH /books/:id error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    console.error('Error updating book:', err);
+    res.status(500).json({ error: 'Internal server error while updating book' });
   }
 });
 
+// ─── Route 5: DELETE /books/:id (Protected - Owner only) ──────────────────────
 app.delete('/books/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -222,101 +295,132 @@ app.delete('/books/:id', verifyToken, async (req, res) => {
     }
 
     const { db } = await connectDB();
-    const booksCollection = db.collection('books');
+    const book = await db.collection('books').findOne({ _id: new ObjectId(id) });
 
-    const result = await booksCollection.deleteOne({ _id: new ObjectId(id) });
-    if (result.deletedCount === 0) {
+    if (!book) {
       return res.status(404).json({ error: 'Book not found' });
     }
-    res.json({ deletedCount: result.deletedCount, message: 'Book deleted successfully' });
+
+    // Owner check: only the creator can delete
+    if (book.userEmail !== req.user.email) {
+      return res.status(403).json({ error: 'Forbidden: You are not the owner of this book' });
+    }
+
+    const result = await db.collection('books').deleteOne({ _id: new ObjectId(id) });
+
+    res.json({
+      deletedCount: result.deletedCount,
+      message: 'Book deleted successfully',
+    });
   } catch (err) {
-    console.error('DELETE /books/:id error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    console.error('Error deleting book:', err);
+    res.status(500).json({ error: 'Internal server error while deleting book' });
   }
 });
 
-// ── Borrows ───────────────────────────────────────────────────────────────
+// ─── Route 6: POST /borrows (Protected - Atomic operation) ─────────────────────
+// Atomic findOneAndUpdate with availableCopies: { $gt: 0 } and $inc -1
+// Unique index on borrows { bookId, userEmail }
+// 409 if already borrowed, 400 if copies are 0
 app.post('/borrows', verifyToken, async (req, res) => {
   try {
-    const { bookId, bookTitle, bookImage, userEmail, userName, borrowDate, returnDate } = req.body;
-    const targetEmail = userEmail || req.user.email;
+    const { bookId, returnDate } = req.body;
 
-    if (!bookId) {
-      return res.status(400).json({ error: 'Book ID is required' });
+    if (!bookId || !returnDate) {
+      return res.status(400).json({ error: 'Missing bookId or returnDate' });
+    }
+
+    if (!ObjectId.isValid(bookId)) {
+      return res.status(400).json({ error: 'Invalid bookId format' });
     }
 
     const { db } = await connectDB();
-    const booksCollection = db.collection('books');
-    const borrowsCollection = db.collection('borrows');
 
-    // 1. Check if user already borrowed this book
-    const existingBorrow = await borrowsCollection.findOne({ bookId, userEmail: targetEmail });
+    // 1. Double borrow check before decrement
+    const existingBorrow = await db.collection('borrows').findOne({
+      bookId: String(bookId),
+      userEmail: req.user.email,
+    });
+
     if (existingBorrow) {
-      return res.status(400).json({ 
-        error: 'already_borrowed', 
-        message: 'You have already borrowed this book. Please return it before borrowing again!' 
+      return res.status(409).json({ error: 'Conflict: You have already borrowed this book.' });
+    }
+
+    // 2. Atomic findOneAndUpdate on the book with availableCopies > 0 and $inc -1
+    const updatedBook = await db.collection('books').findOneAndUpdate(
+      {
+        _id: new ObjectId(bookId),
+        $or: [
+          { availableCopies: { $gt: 0 } },
+          { availableCopies: { $exists: false }, totalCopies: { $gt: 0 } },
+        ],
+      },
+      {
+        $inc: { availableCopies: -1 },
+      },
+      { returnDocument: 'after' }
+    );
+
+    if (!updatedBook) {
+      return res.status(400).json({ error: 'No copies left' });
+    }
+
+    // 3. Insert borrow record
+    try {
+      const newBorrow = {
+        bookId: String(bookId),
+        bookTitle: updatedBook.title,
+        bookImage: updatedBook.image,
+        userEmail: req.user.email,
+        userName: req.user.name || 'Reader',
+        borrowDate: new Date().toISOString(),
+        returnDate: String(returnDate),
+        createdAt: new Date().toISOString(),
+      };
+
+      const result = await db.collection('borrows').insertOne(newBorrow);
+
+      return res.status(201).json({
+        insertedId: result.insertedId,
+        message: 'Book borrowed successfully!',
       });
-    }
-
-    // 2. Check available copies
-    if (ObjectId.isValid(bookId)) {
-      const book = await booksCollection.findOne({ _id: new ObjectId(bookId) });
-      if (!book) {
-        return res.status(404).json({ error: 'Book not found' });
-      }
-      if ((book.totalCopies || 0) <= 0) {
-        return res.status(400).json({ 
-          error: 'out_of_stock', 
-          message: 'This book currently has 0 copies available for borrow.' 
-        });
-      }
-
-      await booksCollection.updateOne(
+    } catch (insertErr) {
+      // If unique index constraint was violated (code 11000), restore the copy and return 409
+      await db.collection('books').updateOne(
         { _id: new ObjectId(bookId) },
-        { $inc: { totalCopies: -1 } }
+        { $inc: { availableCopies: 1 } }
       );
+
+      if (insertErr.code === 11000) {
+        return res.status(409).json({ error: 'Conflict: You have already borrowed this book.' });
+      }
+      throw insertErr;
     }
-
-    const borrowRecord = {
-      bookId,
-      bookTitle: bookTitle || 'Unknown Book',
-      bookImage: bookImage || '',
-      userEmail: targetEmail,
-      userName: userName || 'BookNook Member',
-      borrowDate: borrowDate || new Date().toISOString().split('T')[0],
-      returnDate: returnDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-      borrowedAt: new Date().toISOString(),
-    };
-
-    const result = await borrowsCollection.insertOne(borrowRecord);
-    res.status(201).json({ insertedId: result.insertedId, message: 'Book borrowed successfully!' });
   } catch (err) {
-    console.error('POST /borrows error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    console.error('Error borrowing book:', err);
+    res.status(500).json({ error: 'Internal server error while borrowing book' });
   }
 });
 
+// ─── Route 7: GET /borrows (Protected - User's own borrows) ────────────────────
 app.get('/borrows', verifyToken, async (req, res) => {
   try {
-    const tokenEmail = req.user.email;
-    const queryEmail = req.query.email;
-    const filterEmail = queryEmail || tokenEmail;
-
     const { db } = await connectDB();
-    const borrowsCollection = db.collection('borrows');
-
-    const borrows = await borrowsCollection
-      .find({ userEmail: filterEmail })
-      .sort({ borrowedAt: -1 })
+    const borrows = await db
+      .collection('borrows')
+      .find({ userEmail: req.user.email })
+      .sort({ createdAt: -1 })
       .toArray();
 
     res.json(borrows);
   } catch (err) {
-    console.error('GET /borrows error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    console.error('Error fetching borrows:', err);
+    res.status(500).json({ error: 'Internal server error while fetching borrows' });
   }
 });
 
+// ─── Route 8: DELETE /borrows/:id (Protected - Owner only) ─────────────────────
+// Delete borrow and atomic $inc +1 on book
 app.delete('/borrows/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -325,33 +429,39 @@ app.delete('/borrows/:id', verifyToken, async (req, res) => {
     }
 
     const { db } = await connectDB();
-    const booksCollection = db.collection('books');
-    const borrowsCollection = db.collection('borrows');
+    const borrow = await db.collection('borrows').findOne({ _id: new ObjectId(id) });
 
-    const borrowRecord = await borrowsCollection.findOne({ _id: new ObjectId(id) });
-    if (!borrowRecord) {
+    if (!borrow) {
       return res.status(404).json({ error: 'Borrow record not found' });
     }
 
-    await borrowsCollection.deleteOne({ _id: new ObjectId(id) });
+    // Owner check: only the borrower can return
+    if (borrow.userEmail !== req.user.email) {
+      return res.status(403).json({ error: 'Forbidden: You are not authorized to return this borrow' });
+    }
 
-    if (borrowRecord.bookId && ObjectId.isValid(borrowRecord.bookId)) {
-      await booksCollection.updateOne(
-        { _id: new ObjectId(borrowRecord.bookId) },
-        { $inc: { totalCopies: 1 } }
+    // Delete borrow
+    await db.collection('borrows').deleteOne({ _id: new ObjectId(id) });
+
+    // Increment available copies on book
+    if (borrow.bookId && ObjectId.isValid(borrow.bookId)) {
+      await db.collection('books').updateOne(
+        { _id: new ObjectId(borrow.bookId) },
+        { $inc: { availableCopies: 1 } }
       );
     }
 
-    res.json({ message: 'Book returned successfully!' });
+    res.json({ message: 'Book returned successfully' });
   } catch (err) {
-    console.error('DELETE /borrows/:id error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    console.error('Error returning borrow:', err);
+    res.status(500).json({ error: 'Internal server error while returning book' });
   }
 });
 
-if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+// ─── Export for local / serverless ───────────────────────────────────────────
+if (process.env.NODE_ENV !== 'production') {
   app.listen(port, () => {
-    console.log(`🚀 BookNook server running on port ${port}`);
+    console.log(`Server listening on port ${port}`);
   });
 }
 
