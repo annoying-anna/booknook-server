@@ -2,10 +2,18 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const jose = require('jose');
 
 const app = express();
 const port = process.env.PORT || 5000;
+
+// ─── Dynamic jose import helper (ESM compatible with CommonJS on Vercel) ─────
+let joseModule = null;
+async function getJose() {
+  if (!joseModule) {
+    joseModule = await import('jose');
+  }
+  return joseModule;
+}
 
 // ─── CORS configuration ───────────────────────────────────────────────────────
 const CLIENT_URL = process.env.CLIENT_URL || 'https://booknook-client-tau.vercel.app';
@@ -21,7 +29,7 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(null, true); // Permissive in deployment environments
+      callback(null, true);
     }
   },
   credentials: true,
@@ -69,8 +77,9 @@ async function connectDB() {
 
 // ─── BetterAuth JWT Verification Middleware (using jose & JWKS) ───────────────
 let remoteJWKS = null;
-function getRemoteJWKS() {
+async function getRemoteJWKS() {
   if (!remoteJWKS) {
+    const jose = await getJose();
     const jwksUrl = new URL(`${CLIENT_URL}/api/auth/jwks`);
     remoteJWKS = jose.createRemoteJWKSet(jwksUrl);
   }
@@ -86,7 +95,8 @@ async function verifyToken(req, res, next) {
   const token = authHeader.split(' ')[1];
 
   try {
-    const jwks = getRemoteJWKS();
+    const jose = await getJose();
+    const jwks = await getRemoteJWKS();
     const { payload } = await jose.jwtVerify(token, jwks);
     const email = payload.email || (typeof payload.sub === 'string' && payload.sub.includes('@') ? payload.sub : null);
     if (!email) {
@@ -102,6 +112,7 @@ async function verifyToken(req, res, next) {
   } catch (jwksErr) {
     // Graceful fallback for local development or transitional tokens
     try {
+      const jose = await getJose();
       const claims = jose.decodeJwt(token);
       const email = claims.email || (typeof claims.sub === 'string' && claims.sub.includes('@') ? claims.sub : null);
       if (email) {
@@ -148,6 +159,7 @@ app.get('/books', async (req, res) => {
     // Optional user email filter if mine=true with authorization
     if (mine === 'true' && req.headers['authorization']) {
       try {
+        const jose = await getJose();
         const token = req.headers['authorization'].split(' ')[1];
         const claims = jose.decodeJwt(token);
         if (claims?.email) {
