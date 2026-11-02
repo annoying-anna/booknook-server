@@ -1,63 +1,58 @@
 # BookNook Server API
 
-Backend RESTful API service for **BookNook – A Small Online Library**, built with Express.js, MongoDB Atlas, and JSON Web Token (JWT) authentication.
+Express.js and MongoDB Atlas backend service powering **BookNook – An Online Community Library**.
 
-## 🚀 Live Server URL
-- **API Base URL**: `https://booknook-server.vercel.app` (or local `http://localhost:5000`)
+## 🚀 Live API URL
+- **Production API**: `https://booknook-server-ashy.vercel.app`
+- **Local Development**: `http://localhost:5000`
 
-## ✨ Key Features
-- **JWT Authentication**: Secure token generation via `/jwt` and middleware verification (`verifyToken`) on all protected mutations.
-- **Full Books CRUD**: Public endpoints to browse books, filter by category or creator email, read book details, and authenticated endpoints to add, update, and delete books.
-- **Smart Borrowing System**: Tracks active borrows, prevents double-borrowing of the same book simultaneously, and validates stock availability.
-- **Atomic Inventory Updates**: Utilizes MongoDB `$inc` operator to decrement `totalCopies` on borrow and automatically restore copies on return.
-- **RESTful Architecture**: Clean HTTP status codes, structured error handling, CORS headers enabled, and modular deployment ready for Vercel/Render.
+---
 
-## 🛠️ Tech Stack
-- **Runtime**: Node.js
-- **Framework**: Express.js
-- **Database**: MongoDB Atlas with native MongoDB driver v6
-- **Security**: JSON Web Token (jsonwebtoken), CORS, dotenv
-- **Deployment**: Vercel Serverless Function (`vercel.json`)
+## 🔒 Authentication & Authorization
+- **BetterAuth JWT Verification with `jose`**: Protected routes verify JWT tokens issued by BetterAuth using `jose` and remote JSON Web Key Sets (JWKS) fetched from `<CLIENT_URL>/api/auth/jwks`.
+- **Identity Enforcement**: The user identity (email) is strictly parsed and verified from the cryptographically signed JWT token (`req.user.email`), never trusted from the client request body.
+- **Resource Ownership**:
+  - `PATCH /books/:id` and `DELETE /books/:id`: Only the user who originally created the book (`book.userEmail === token.email`) is allowed to update or delete it; otherwise returns HTTP 403 Forbidden.
+  - `DELETE /borrows/:id`: Only the borrower (`borrow.userEmail === token.email`) is allowed to return the book; otherwise returns HTTP 403 Forbidden.
 
-## 📋 API Endpoints
+---
 
-| Method | Endpoint | Access | Description |
-|---|---|---|---|
-| `GET` | `/` | Public | Server health check & API directory |
-| `POST` | `/jwt` | Public | Generates a 7-day signed JWT token |
-| `GET` | `/books` | Public | Get all books (supports `?email=`, `?category=`, `?limit=`) |
-| `GET` | `/books/new-arrivals` | Public | Get latest 6 books sorted by newest first |
-| `GET` | `/books/:id` | Public | Get single book details by ObjectId |
-| `POST` | `/books` | Protected (JWT) | Add a new book to the library |
-| `PATCH` | `/books/:id` | Protected (JWT) | Update existing book information |
-| `DELETE` | `/books/:id` | Protected (JWT) | Remove a book from the library |
-| `POST` | `/borrows` | Protected (JWT) | Borrow a book (checks copies & prevents double borrow) |
-| `GET` | `/borrows` | Protected (JWT) | Get borrows belonging to the authenticated user |
-| `DELETE` | `/borrows/:id` | Protected (JWT) | Return a book & increment available copies |
+## 📋 API Route Table (All 8 Core Routes)
+
+| # | Method | Endpoint | Access | Description |
+|---|---|---|---|---|
+| 1 | `GET` | `/books` | **Public** | Browse catalog. Supports `?sort=newest&limit=&category=&search=` |
+| 2 | `GET` | `/books/:id` | **Protected (JWT)** | Fetch single book details by ObjectId |
+| 3 | `POST` | `/books` | **Protected (JWT)** | Create a book. Sets `availableCopies = totalCopies`, userEmail from token |
+| 4 | `PATCH` | `/books/:id` | **Protected (JWT)** | Update book details (Owner only, 403 otherwise) |
+| 5 | `DELETE` | `/books/:id` | **Protected (JWT)** | Delete book from catalog (Owner only, 403 otherwise) |
+| 6 | `POST` | `/borrows` | **Protected (JWT)** | Atomic borrow: checks stock, verifies unique constraint, decrements copies |
+| 7 | `GET` | `/borrows` | **Protected (JWT)** | Get all borrows belonging to the authenticated user |
+| 8 | `DELETE` | `/borrows/:id` | **Protected (JWT)** | Return a book: deletes borrow record, increments copies (Owner only) |
+
+---
+
+## ⚡ Atomic Borrowing & Stock Guarantee
+The `POST /borrows` endpoint prevents race conditions and ensures data integrity:
+1. Validates that the user has not already borrowed this book via the compound unique index on `{ bookId: 1, userEmail: 1 }`. If already borrowed, returns **HTTP 409 Conflict**.
+2. Executes an atomic `findOneAndUpdate` with query `{ availableCopies: { $gt: 0 } }` and update `{ $inc: { availableCopies: -1 } }`. If no copies remain, returns **HTTP 400 Bad Request ("No copies left")**.
+3. Inserts the borrow record `{ bookId, bookTitle, bookImage, userEmail, borrowDate, returnDate }`. In the event of a duplicate key error (code 11000), automatically restores the copy with `$inc: { availableCopies: 1 }` and returns **HTTP 409 Conflict**.
+
+---
 
 ## ⚙️ Environment Variables
-Create a `.env` file in the root directory:
+Create a `.env` file (see `.env.example`):
 ```env
 PORT=5000
-MONGODB_URI=mongodb+srv://<username>:<password>@annoying.208jf6p.mongodb.net/booknook
-JWT_SECRET=your_jwt_secret_key
+MONGODB_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/booknook
+CLIENT_URL=https://booknook-client-tau.vercel.app
 ```
 
-## 💻 Local Setup & Development
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Populate sample books (optional):
-   ```bash
-   node seed.js
-   ```
-4. Run development server:
-   ```bash
-   npm run dev
-   # or
-   npm start
-   ```
-5. Server will start at `http://localhost:5000`.
+---
 
+## 🛠️ Local Setup
+```bash
+npm install
+node seed.js    # Seed sample books with availableCopies
+npm start       # Starts server on http://localhost:5000
+```
